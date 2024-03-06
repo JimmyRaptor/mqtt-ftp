@@ -10,7 +10,7 @@ FTP_PASS = "rosCore!"
 FTP_DIR = "/"
 
 # MQTT Broker settings
-MQTT_BROKER = ""
+MQTT_BROKER = "localhost"
 MQTT_USER = "test"
 MQTT_PASS = "test"
 BASE_MQTT_TOPIC = "/pk/telemetry/"  # Base topic for MQTT messages

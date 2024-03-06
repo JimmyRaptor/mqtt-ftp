@@ -48,10 +48,10 @@ logging.basicConfig(
 load_dotenv()
 
 # Configuration
-mqtt_url = "35.247.9.156"
+mqtt_url = "localhost"
 mqtt_username = "test"
 mqtt_password = "test"
-post_url = "http://35.247.9.156:3001/mqttjson"
+post_url = "localhost:3001/mqttjson"
 
 
 # MQTT callbacks

@@ -8,8 +8,8 @@ DATABASE_CONFIG = {
     "user": "raptortech",
     "password": "raptortechAreCool1!",
     "database": "mqtt",
-    "host": "localhost",
-    "port": 5433,
+    "host": "10.162.0.2",
+    "port": 5432,
 }
 
 # Configure logging
