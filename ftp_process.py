@@ -12,7 +12,7 @@ from psycopg2 import pool
 
 from utils import CRC, normalize_timestamp
 
-FTP_HOST = "35.247.9.156"
+FTP_HOST = "localhost"
 FTP_USER = "raptorcore"
 FTP_PASS = "rosCore!"
 
