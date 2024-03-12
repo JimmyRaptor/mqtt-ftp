@@ -1,111 +1,90 @@
-import os
-from dotenv import load_dotenv
 import logging
+import logging.config
 import paho.mqtt.client as mqtt
 import cbor2
-import requests
 import asyncio
+import configparser
+import aiohttp
+from functools import partial
 from database_utils import insert_data
+from utils import CRC
+
 
 headers = {"Content-Type": "application/json"}
-buffer = []
+buffer = asyncio.Queue()
 BATCH_SIZE = 50
-CRCFAILNUM = 0
-INSERTNUMBER = 0
-RECORDNUMBER = 0
+CRC_FAIL_NUM = 0
 
-def CRC16(a, crc):
-    for x in range(8):
-        if (a & 0x01) ^ (crc & 0x01):
-            crc >>= 1
-            crc ^= 0x8408
-        else:
-            crc >>= 1
-        a >>= 1
-    return crc
-
-
-def CRC(packet, generate):
-    crc = 0
-    for x in range(len(packet)):
-        crc = CRC16(packet[x], crc)
-    if not generate:
-        if crc == 0xF0B8:
-            return True
-        else:
-            return False
-    else:
-        return (crc ^ 65535).to_bytes(2, "little")
 
 
 # configure logging
-logging.basicConfig(
-    filename="mqtt-api.log",
-    filemode="a",
-    format="%(asctime)s - %(message)s",
-    level=logging.INFO,
-)
-
-# Load environment variables
-load_dotenv()
-
-# Configuration
-mqtt_url = "35.247.9.156"
-mqtt_username = "test"
-mqtt_password = "test"
-post_url = "http://35.247.9.156:3001/mqttjson"
+logging.config.fileConfig('logging.ini')
+logging = logging.getLogger("mqttLogger")
 
 
-# MQTT callbacks
+
+config = configparser.ConfigParser()
+config.read('mqtt.ini')
+
+
+mqtt_url = config['mqtt']['url']
+mqtt_username = config['mqtt']['username']
+mqtt_password = config['mqtt']['password']
+post_url = config['http']['post_url']
+
+async def http_post(session, url, data):
+    async with session.post(url, json=data, headers=headers) as response:
+        return await response.text()
+
 def on_connect(client, userdata, flags, rc):
-    print("Connected to MQTT Broker")
     client.subscribe("/pk/telemetry/#")
 
 
-def on_message(client, userdata, msg):
-    global RECORDNUMBER
-    global buffer
-    if CRC(msg.payload, False):
-        try:
-            data = cbor2.loads(msg.payload)
-            data = dict(data)
-            data_id = msg.topic.split("/")[3]
-            data["id"] = data_id
-            requests.post(post_url, json=data, headers=headers)
-            RECORDNUMBER += 1
-            logging.info(f"RECORDNUMBER: {RECORDNUMBER}")
-            buffer.append(data)
-            print(len(buffer))
-            if len(buffer) >= BATCH_SIZE:
-                asyncio.run(handle_batch())
-        except Exception as err:
-            print(f"CBOR parsing error: {err}")
-    else:
-        global CRCFAILNUM
-        CRCFAILNUM += 1
-        logging.info(f"CRCFAILNUM: {CRCFAILNUM}")
+def on_message(client, userdata, msg, loop):
+    asyncio.run_coroutine_threadsafe(handle_message(msg), loop)
 
+
+async def handle_message(msg):
+    global count
+    if CRC(msg.payload, False):
+        if msg.payload[0] == 0x78:
+            msg.payload = msg.payload[1:]
+        data = cbor2.loads(msg.payload)
+        data = dict(data)
+        data_id = msg.topic.split("/")[3]
+        data["id"] = data_id
+        async with aiohttp.ClientSession() as session:
+            await http_post(session, post_url, data)
+        await buffer.put(data)
+        if buffer.qsize() >= BATCH_SIZE:
+            await handle_batch()
 
 async def handle_batch():
     global buffer
-    global INSERTNUMBER
-    await insert_data(buffer)
-    # Clear the buffer after insertion to avoid re-inserting the same items
-    buffer.clear()
-    INSERTNUMBER += 1
-    logging.info(f"INSERTNUMBER: {INSERTNUMBER}")
+    items = []
+    for _ in range(BATCH_SIZE):
+        item = await buffer.get()
+        items.append(item)
+        buffer.task_done()  
 
-
-# Connect to the MQTT broker
+    await insert_data(items)
+    print(f"Batch insert successful: {len(items)} items inserted.")
+    
 async def connect_and_subscribe_to_mqtt():
+    loop = asyncio.get_running_loop()
     client = mqtt.Client()
     client.username_pw_set(username=mqtt_username, password=mqtt_password)
     client.on_connect = on_connect
-    client.on_message = on_message
+    client.on_message = lambda client, userdata, msg: asyncio.run_coroutine_threadsafe(handle_message(msg), loop)
     client.connect(mqtt_url, 1883, 60)
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, client.loop_forever)
+    client.loop_start()
 
+async def main():
+    await connect_and_subscribe_to_mqtt()
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    asyncio.run(connect_and_subscribe_to_mqtt())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Program stopped by KeyboardInterrupt")

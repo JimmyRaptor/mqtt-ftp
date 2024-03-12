@@ -1,51 +1,57 @@
+import inspect
 import json
 import logging
-import logging.config
+from logging.config import fileConfig
 import os
 import time
-
+import datetime
 import cbor2
 import ftplib
 import psycopg2
 import psycopg2.extras
 from psycopg2 import pool
+import configparser
 
 from utils import CRC, normalize_timestamp
 
-FTP_HOST = "localhost"
-FTP_USER = "raptorcore"
-FTP_PASS = "rosCore!"
+config = configparser.ConfigParser()
+config.read(['ftp.ini', 'database.ini'])
+
+# FTP Configuration
+FTP_HOST = config['ftp']['host']
+FTP_USER = config['ftp']['user']
+FTP_PASS = config['ftp']['password']
+
 
 
 # configure logging
-logging.basicConfig(
-    filename="ftp-process.log",
-    filemode="a",
-    format="%(asctime)s - %(message)s",
-    level=logging.INFO,
-)
+fileConfig('logging.ini')
+logger = logging.getLogger('ftpLogger')
+
+# Load and parse the FTP and Database configurations
+
 
 # Database configuration
 DEV_DATABASE_CONFIG = {
-    "user": "raptortech",
-    "password": "raptortechAreCool1!",
-    "database": "mqtt",
-    "host": "10.162.0.2",
-    "port": "5432",
+    "user": config['dev']['user'],
+    "password": config['dev']['password'],
+    "database": config['dev']['database'],
+    "host": config['dev']['host'],
+    "port": config['dev']['port'],
 }
 
 PROD_DATABASE_CONFIG = {
-    "user": "raptortech",
-    "password": "raptortechAreCool1!",
-    "database": "mqttjson",
-    "host": "10.128.0.7",
-    "port": "5432",
+    "user": config['prod']['user'],
+    "password": config['prod']['password'],
+    "database": config['prod']['database'],
+    "host": config['prod']['host'],
+    "port": config['prod']['port'],
 }
 
 # Connect to the database
 DevDB_connection = pool.SimpleConnectionPool(
     1,
-    5,
+    10,
     dbname=DEV_DATABASE_CONFIG["database"],
     user=DEV_DATABASE_CONFIG["user"],
     password=DEV_DATABASE_CONFIG["password"],
@@ -55,7 +61,7 @@ DevDB_connection = pool.SimpleConnectionPool(
 
 ProdDB_connection = pool.SimpleConnectionPool(
     1,
-    5,
+    10,
     dbname=PROD_DATABASE_CONFIG["database"],
     user=PROD_DATABASE_CONFIG["user"],
     password=PROD_DATABASE_CONFIG["password"],
@@ -63,8 +69,6 @@ ProdDB_connection = pool.SimpleConnectionPool(
     port=PROD_DATABASE_CONFIG["port"],
 )
 
-fileNumber = 0
-RecordNumber = 0
 batch = []
 batch_size = 50
 
@@ -82,7 +86,6 @@ def connect_to_ftp():
 
 
 def check_and_process_files(ftp):
-    global fileNumber
     current_files = ftp.nlst()  # List of files in the current directory
     folder_names = [
         "cfg",
@@ -105,15 +108,12 @@ def check_and_process_files(ftp):
         # Move the file to the 'archive' folder
         try:
             ftp.rename(source_path, destination_path)
-            logging.info(f"Moved {filename} to archive folder successfully.")
+            logger.info(f"Moved {filename} to archive folder successfully.")
         except Exception as e:
-            logging.info(f"Error moving {filename} to archive folder: {e}")
+            logger.info(f"Error moving {filename} to archive folder: {e}")
 
 # Process the file
-
-
 def process_file(ftp, filename):
-    global RecordNumber
     global batch
     local_filename = os.path.join("/tmp", filename)
     with open(local_filename, "wb") as local_file:
@@ -140,14 +140,10 @@ def process_file(ftp, filename):
         insert_batch(batch, DevDB_connection, ProdDB_connection)
         batch = []
     os.remove(local_filename)
-
-
 def get_caller_filename():
     return inspect.stack()[2].filename
-
-
 def insert_batch(batch, DevDB_connection, ProdDB_connection):
-    """Inserts a batch of records into the PostgreSQL database."""
+    """Inserts or updates a batch of records into the PostgreSQL database based on a conflict."""
     try:
         with DevDB_connection.getconn() as dev_conn, ProdDB_connection.getconn() as prod_conn:
             DevCursor = dev_conn.cursor()
@@ -157,24 +153,31 @@ def insert_batch(batch, DevDB_connection, ProdDB_connection):
             for data in batch:
                 if "ts" in data and "id" in data:
                     try:
+                        created_timestamp = datetime.datetime.now().replace(microsecond=0)
                         adjusted_timestamp = normalize_timestamp(data["ts"])
+                        date_format = '%Y-%m-%d %H:%M:%S'
+                        adjusted_timestamp = datetime.datetime.strptime(adjusted_timestamp[:-3], date_format)
                     except Exception as e:
-                        logging.error(
+                        logger.error(
                             f"Error in normalize_timestamp (from {get_caller_filename()}): {e}"
                         )
                         continue
 
                     record = (
+                        created_timestamp,
                         adjusted_timestamp,
                         json.dumps(data),
                         data["id"],
                     )
                     transformed_batch.append(record)
                 else:
-                    logging.warning("Missing 'ts' in data, skipping record.")
+                    logger.warning("Missing 'ts' in data, skipping record.")
 
             if transformed_batch:
-                query = "INSERT INTO mqttjson (time, data, device_id) VALUES %s;"
+                query = """
+                INSERT INTO mqtttest (created, time, data, device_id)
+                VALUES %s
+                """
 
                 psycopg2.extras.execute_values(
                     DevCursor, query, transformed_batch, template=None
@@ -186,19 +189,11 @@ def insert_batch(batch, DevDB_connection, ProdDB_connection):
 
                 dev_conn.commit()
                 prod_conn.commit()
-
-                global RecordNumber
-                RecordNumber += len(transformed_batch)
-                logging.info(
-                    f"Batch inserted into DevDB, record total: {RecordNumber}")
-                logging.info(
-                    f"Batch inserted into ProdDB, record total: {RecordNumber}")
             else:
-                logging.warning("No valid data to insert.")
+                logger.warning("No valid data to insert.")
 
     except Exception as e:
-        logging.error(f"Error inserting batch into database: {e}")
-
+        logger.error(f"Error inserting batch into database: {e}")
 
 # Main loop
 def main():
@@ -209,7 +204,7 @@ def main():
             ftp.quit()
             time.sleep(20)
         except Exception as e:
-            print(f"Error: {e}")
+            logger.error(f"Error: {e}")
 
 
 if __name__ == "__main__":

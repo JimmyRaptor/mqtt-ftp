@@ -1,7 +1,6 @@
-from datetime import datetime
 import logging
 from typing import Optional
-
+from datetime import datetime
 
 def CRC16(a, crc):
     for x in range(8):
@@ -48,9 +47,12 @@ def normalize_timestamp(timestamp: float) -> Optional[str]:
                 formatted_date = f"{date:%Y-%m-%d %H:%M:%S}+00"
                 return formatted_date
             else:
-                # If neither the original nor the adjusted year is this year, raise an error
-                raise ValueError("Timestamp is not within the expected range.")
-
+                # If neither the original nor the adjusted year is this year, return actual ts
+                date = datetime.utcfromtimestamp(timestamp)
+                formatted_date = f"{date:%Y-%m-%d %H:%M:%S}+00"
+                return formatted_date
+                #raise ValueError("Timestamp is not within the expected range.")
+    # to handle the case where the timestamp is not a number
     except ValueError as e:
         # Handle the error case
         logging.error(f"Error normalizing timestamp: {e}")
