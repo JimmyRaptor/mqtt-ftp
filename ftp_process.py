@@ -6,8 +6,9 @@ from logging.config import fileConfig
 import datetime
 import cbor2
 import ftplib
-from sqlalchemy import create_engine, Column, Integer, DateTime, String
+from sqlalchemy import create_engine
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.sql import text
 from sqlalchemy.orm import declarative_base, sessionmaker
 import configparser
 
@@ -24,14 +25,6 @@ logger = logging.getLogger('ftpLogger')
 Base = declarative_base()
 
 
-class RawData(Base):
-    __tablename__ = 'ts_raw'
-    __table_args__ = {'schema': 'ts'}
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    created = Column(DateTime)
-    time = Column(DateTime)
-    data = Column(JSONB)
-    device_id = Column(String)
 
 
 DEV_DATABASE_URL = f"postgresql://{config['dev']['user']}:{config['dev']['password']}@{config['dev']['host']}:{config['dev']['port']}/{config['dev']['database']}"
@@ -141,7 +134,19 @@ def transform_data(batch):
 def insert_transformed_data(session, transformed_batch):
     start_time = time.time()  
     try:
-        session.bulk_insert_mappings(RawData, transformed_batch)
+        insert_query = text("""
+            INSERT INTO ts.ts_raw (created, time, data, device_id)
+            VALUES (:created, :time, :data, :device_id)
+        """)
+        
+        for record in transformed_batch:
+            session.execute(insert_query, {
+                'created': record['created'],
+                'time': record['time'],
+                'data': record['data'],
+                'device_id': record['device_id']
+            })
+        
         session.commit()
         end_time = time.time()  
         elapsed_time = end_time - start_time  
