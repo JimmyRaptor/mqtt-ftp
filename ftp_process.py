@@ -1,97 +1,101 @@
-import inspect
+import os
+import time
 import json
 import logging
 from logging.config import fileConfig
-import os
-import time
 import datetime
 import cbor2
 import ftplib
-import psycopg2
-import psycopg2.extras
-from psycopg2 import pool
+from sqlalchemy import create_engine, Column, Integer, DateTime, String
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import declarative_base, sessionmaker
 import configparser
 
-from utils import CRC, normalize_timestamp
+from utils import CRC, normalize_timestamp 
+
 
 config = configparser.ConfigParser()
 config.read(['ftp.ini', 'database.ini'])
 
-# FTP Configuration
+
+fileConfig('logging.ini')
+logger = logging.getLogger('ftpLogger')
+
+Base = declarative_base()
+
+
+class RawData(Base):
+    __tablename__ = 'ts_raw'
+    __table_args__ = {'schema': 'ts'}
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    created = Column(DateTime)
+    time = Column(DateTime)
+    data = Column(JSONB)
+    device_id = Column(String)
+
+
+DEV_DATABASE_URL = f"postgresql://{config['dev']['user']}:{config['dev']['password']}@{config['dev']['host']}:{config['dev']['port']}/{config['dev']['database']}"
+PROD_DATABASE_URL = f"postgresql://{config['prod']['user']}:{config['prod']['password']}@{config['prod']['host']}:{config['prod']['port']}/{config['prod']['database']}"
+
+
+dev_engine = create_engine(DEV_DATABASE_URL, pool_size=10, max_overflow=20)
+prod_engine = create_engine(PROD_DATABASE_URL, pool_size=10, max_overflow=20)
+
+DevSession = sessionmaker(bind=dev_engine)
+ProdSession = sessionmaker(bind=prod_engine)
+
 FTP_HOST = config['ftp']['host']
 FTP_USER = config['ftp']['user']
 FTP_PASS = config['ftp']['password']
 
 
-# configure logging
-fileConfig('logging.ini')
-logger = logging.getLogger('ftpLogger')
-
-# Load and parse the FTP and Database configurations
-
-DEV_DATABASE_CONFIG = config['dev']
-dev_conn_info = {key: value for key, value in DEV_DATABASE_CONFIG.items()}
-
-PROD_DATABASE_CONFIG = config['prod']
-prod_conn_info = {key: value for key, value in PROD_DATABASE_CONFIG.items()}
-
 batch = []
 batch_size = 30
 
 
-# Connect to the FTP server
 def connect_to_ftp():
     try:
         ftp = ftplib.FTP(FTP_HOST, FTP_USER, FTP_PASS)
         ftp.cwd("/")
-        print("Successfully connected to FTP server.")
+        logger.info("Successfully connected to FTP server.")
         return ftp
     except Exception as e:
-        print(f"Failed to connect to FTP server: {e}")
+        logger.error(f"Failed to connect to FTP server: {e}")
         return None
 
 
 def check_and_process_files(ftp):
-    current_files = ftp.nlst()  # List of files in the current directory
-    folder_names = [
-        "cfg",
-        "jake",
-        "kyle",
-        "test",
-        "write",
-        "archive",
-    ]  # List of folder names to ignore
+    current_files = ftp.nlst()
+    folder_names = ["cfg", "jake", "kyle", "test", "write", "archive"]
 
     for filename in current_files:
         if filename in folder_names or os.path.splitext(filename)[1]:
-            continue  # Skip folders and files with extensions
+            continue
 
-        process_file(ftp, filename)
-        # Define the source and destination paths
+        with DevSession() as dev_session, ProdSession() as prod_session:
+            process_file(ftp, filename, dev_session, prod_session)
+
         source_path = filename
         destination_path = f"archive/{filename}"
-
-        # Move the file to the 'archive' folder
         try:
             ftp.rename(source_path, destination_path)
             logger.info(f"Moved {filename} to archive folder successfully.")
         except Exception as e:
-            logger.info(f"Error moving {filename} to archive folder: {e}")
+            logger.error(f"Error moving {filename} to archive folder: {e}")
 
-# Process the file
-def process_file(ftp, filename):
+
+def process_file(ftp, filename, dev_session, prod_session):
     global batch
     local_filename = os.path.join("/tmp", filename)
     with open(local_filename, "wb") as local_file:
         ftp.retrbinary("RETR " + filename, local_file.write)
 
-    # Read the file content
     with open(local_filename, "rb") as local_file:
         file_content = local_file.read()
 
     device_id = filename.split("_")[0]
-
     json_strings = file_content.split(b"xxx")
+
     for json_str in json_strings:
         if CRC(json_str, False):
             if len(json_str) >= 20:
@@ -100,108 +104,69 @@ def process_file(ftp, filename):
                 data["id"] = device_id
                 batch.append(data)
                 if len(batch) >= batch_size:
-                    # Attempt to insert the batch into the database
-                    success = insert_batch(
-                        batch, dev_conn_info, prod_conn_info)
-                    if success:
-                        batch = []  # Reset batch only if insertion was successful
-                    else:
-                        return  # Do not proceed with moving the file if insertion failed
+                    process_and_insert_batch(batch, dev_session, prod_session)
+                    batch = []
+
     if len(batch) > 0:
-        # Attempt to insert any remaining records in the batch
-        success = insert_batch(batch, dev_conn_info, prod_conn_info)
-        if not success:
-            return  # Do not proceed with moving the file if insertion failed
+        process_and_insert_batch(batch, dev_session, prod_session)
         batch = []
 
-    # Define the source and destination paths
-    source_path = filename
-    destination_path = f"archive/{filename}"
-
-    # Move the file to the 'archive' folder if insertion was successful
-    try:
-        ftp.rename(source_path, destination_path)
-        logger.info(f"Moved {filename} to archive folder successfully.")
-    except Exception as e:
-        logger.error(f"Error moving {filename} to archive folder: {e}")
-
-    # Cleanup: remove the temporary local file
     os.remove(local_filename)
 
-def get_caller_filename():
-    return inspect.stack()[2].filename
 
-def insert_batch(batch, dev_conn_info, prod_conn_info):
-    dev_conn = None
-    prod_conn = None
+def transform_data(batch):
+    transformed_batch = []
+    for data in batch:
+        if "ts" in data and "id" in data:
+            try:
+                created_timestamp = datetime.datetime.now().replace(microsecond=0)
+                adjusted_timestamp = normalize_timestamp(data["ts"])
+                date_format = '%Y-%m-%d %H:%M:%S'
+                adjusted_timestamp = datetime.datetime.strptime(
+                    adjusted_timestamp[:-3], date_format)
+                record = {
+                    'created': created_timestamp,
+                    'time': adjusted_timestamp,
+                    'data': json.dumps(data),
+                    'device_id': data["id"],
+                }
+                transformed_batch.append(record)
+            except Exception as e:
+                logger.error(f"Error in normalize_timestamp: {e}")
+        else:
+            logger.warning("Missing 'ts' in data, skipping record.")
+    return transformed_batch
+
+
+def insert_transformed_data(session, transformed_batch):
+    start_time = time.time()  
     try:
-        dev_conn = psycopg2.connect(**dev_conn_info)
-        prod_conn = psycopg2.connect(**prod_conn_info)
-        with dev_conn, prod_conn:
-            with dev_conn.cursor() as DevCursor, prod_conn.cursor() as ProdCursor:
-                transformed_batch = []
-                for data in batch:
-                    if "ts" in data and "id" in data:
-                        try:
-                            created_timestamp = datetime.datetime.now().replace(microsecond=0)
-                            adjusted_timestamp = normalize_timestamp(
-                                data["ts"])
-                            date_format = '%Y-%m-%d %H:%M:%S'
-                            adjusted_timestamp = datetime.datetime.strptime(
-                                adjusted_timestamp[:-3], date_format)
-                        except Exception as e:
-                            logger.error(
-                                f"Error in normalize_timestamp (from {get_caller_filename()}): {e}"
-                            )
-                            continue
-
-                        record = (
-                            created_timestamp,
-                            adjusted_timestamp,
-                            json.dumps(data),
-                            data["id"],
-                        )
-                        transformed_batch.append(record)
-                    else:
-                        logger.warning(
-                            "Missing 'ts' in data, skipping record.")
-
-                if transformed_batch:
-                    query = """
-                    INSERT INTO ts.ts_raw (created, time, data, device_id)
-                    VALUES %s
-                    """
-                    psycopg2.extras.execute_values(
-                        DevCursor, query, transformed_batch)
-                    psycopg2.extras.execute_values(
-                        ProdCursor, query, transformed_batch)
-                    dev_conn.commit()
-                    prod_conn.commit()
+        session.bulk_insert_mappings(RawData, transformed_batch)
+        session.commit()
+        end_time = time.time()  
+        elapsed_time = end_time - start_time  
+        logger.info(f"Batch inserted successfully. Execution time: {elapsed_time:.2f} seconds.")
     except Exception as e:
+        session.rollback()
         logger.error(f"Error inserting batch into database: {e}")
-        if dev_conn:
-            dev_conn.rollback()
-        if prod_conn:
-            prod_conn.rollback()
-    finally:
-
-        if dev_conn:
-            dev_conn.close()
-        if prod_conn:
-            prod_conn.close()
 
 
-# Main loop
+def process_and_insert_batch(batch, dev_session, prod_session):
+    transformed_batch = transform_data(batch)
+    insert_transformed_data(dev_session, transformed_batch)
+    insert_transformed_data(prod_session, transformed_batch)
+
+
 def main():
     while True:
         try:
             ftp = connect_to_ftp()
-            check_and_process_files(ftp)
-            ftp.quit()
-
+            if ftp:
+                check_and_process_files(ftp)
+                ftp.quit()
             time.sleep(20)
         except Exception as e:
-            logger.error(f"Error: {e}")
+            logger.error(f"Error in main loop: {e}")
 
 
 if __name__ == "__main__":
