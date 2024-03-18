@@ -11,7 +11,6 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import text
 from sqlalchemy.orm import declarative_base, sessionmaker
 import configparser
-
 from utils import CRC, normalize_timestamp 
 
 
@@ -44,7 +43,7 @@ FTP_PASS = config['ftp']['password']
 
 batch = []
 batch_size = 30
-
+called_count = 0
 
 def connect_to_ftp():
     try:
@@ -76,6 +75,18 @@ def check_and_process_files(ftp):
         except Exception as e:
             logger.error(f"Error moving {filename} to archive folder: {e}")
 
+def extract_object_values(data):
+    global called_count  
+    result = {}
+    for key, value in data.items():
+        if isinstance(value, dict):
+            called_count += 1
+            logger.info("called extract function ",called_count)
+            result[key] = value.values()
+        else:
+            result[key] = value
+    
+    return result
 
 def process_file(ftp, filename, dev_session, prod_session):
     global batch
@@ -93,7 +104,8 @@ def process_file(ftp, filename, dev_session, prod_session):
         if CRC(json_str, False):
             if len(json_str) >= 20:
                 data = cbor2.loads(json_str)
-                data = dict(data)
+                #data = dict(data)
+                data = extract_object_values(data)
                 data["id"] = device_id
                 batch.append(data)
                 if len(batch) >= batch_size:
