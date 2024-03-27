@@ -2,3 +2,4 @@
 /countMessage.log
 /insert_into_database.py
 /mqtt.py
+*.log
